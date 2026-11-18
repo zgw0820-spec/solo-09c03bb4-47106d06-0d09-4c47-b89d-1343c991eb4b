@@ -57,6 +57,7 @@ start_web() {
   DATA_DIR="$WORK/data" LIVE_DIR="$WORK/live" RELOAD_DIR="$WORK/reload" \
   NGINX_PROBE_HOST=127.0.0.1 NGINX_PROBE_PORT="$TLS_PORT" \
   RECEIPT_TIMEOUT=6 VERIFY_TIMEOUT=10 PENDING_TTL=20 STARTUP_PROBE_TIMEOUT=20 \
+  ALERT_INTERVAL="${ALERT_INTERVAL:-2}" PROBE_TIMEOUT="${PROBE_TIMEOUT:-3}" \
   ACTIVATE_DELAY_AFTER_WRITE="$DELAY" \
   nohup python3 -m uvicorn app.main:app --app-dir "$ROOT/web" \
     --host 127.0.0.1 --port "$WEB_PORT" > "$WORK/web.log" 2>&1 &
@@ -109,9 +110,20 @@ case "${1:-}" in
     kill -9 "$(cat "$RUN/web.pid")" 2>/dev/null || true
     echo "WEB KILLED"
     ;;
+  down-nginx)  # 模拟探测中断：停掉 nginx 与 watcher
+    [ -f "$RUN/watcher.pid" ] && kill "$(cat "$RUN/watcher.pid")" 2>/dev/null || true
+    [ -f "$RUN/nginx.pid" ] && kill "$(cat "$RUN/nginx.pid")" 2>/dev/null || true
+    sleep 0.5
+    echo "NGINX DOWN"
+    ;;
+  start-nginx) # 恢复 nginx（watcher 同步重启）
+    start_nginx
+    wait_tls
+    echo "NGINX UP"
+    ;;
   status)
     curl -s "http://127.0.0.1:$WEB_PORT/api/status" | python3 -m json.tool | head -40
     ;;
   *)
-    echo "usage: $0 up|down|restart-web|kill-web|status" >&2; exit 2;;
+    echo "usage: $0 up|down|restart-web|kill-web|down-nginx|start-nginx|status" >&2; exit 2;;
 esac

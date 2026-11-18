@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import logging
 import os
 import socket
@@ -24,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 
 from . import certutil
+from .alerts import AlertEngine
 from .db import DB
 
 log = logging.getLogger("certops")
@@ -65,6 +65,8 @@ class Config:
     probe_interval: float = 0.5
     startup_probe_timeout: float = 15.0
     restore_interval: float = 30.0    # 无在途操作时一致性修复的最小间隔
+    alert_interval: float = 5.0       # 到期告警采样间隔（对新建 TLS 握手）
+    probe_timeout: float = 3.0        # 单次握手超时
     activate_delay_after_write: float = 0.0  # 测试钩子：写完文件后人为延迟
 
     @property
@@ -85,12 +87,21 @@ class Config:
             verify_timeout=float(e.get("VERIFY_TIMEOUT", "10")),
             pending_ttl=float(e.get("PENDING_TTL", "45")),
             startup_probe_timeout=float(e.get("STARTUP_PROBE_TIMEOUT", "15")),
+            alert_interval=float(e.get("ALERT_INTERVAL", "5")),
+            probe_timeout=float(e.get("PROBE_TIMEOUT", "3")),
             activate_delay_after_write=float(e.get("ACTIVATE_DELAY_AFTER_WRITE", "0")),
         )
 
 
 def tls_fingerprint(host: str, port: int, server_name: str, timeout: float = 3.0) -> str:
     """新建一条 TLS 连接，返回对端叶子证书的 SHA-256 指纹。"""
+    return tls_served_cert(host, port, server_name, timeout).fingerprint
+
+
+def tls_served_cert(
+    host: str, port: int, server_name: str, timeout: float = 3.0
+) -> certutil.ServedCert:
+    """新建一条 TLS 连接，解析对端叶子证书（指纹 + 有效期）。"""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -101,7 +112,12 @@ def tls_fingerprint(host: str, port: int, server_name: str, timeout: float = 3.0
                 der = ssock.getpeercert(binary_form=True)
     except OSError as exc:
         raise ProbeError(str(exc)) from exc
-    return hashlib.sha256(der).hexdigest()
+    if not der:
+        raise ProbeError("TLS 握手未返回对端证书")
+    try:
+        return certutil.inspect_served_der(der)
+    except certutil.CertError as exc:
+        raise ProbeError(str(exc)) from exc
 
 
 class FileReloadChannel:
@@ -141,8 +157,14 @@ class RealControl:
         self.channel = FileReloadChannel(cfg.reload_dir)
 
     def probe(self) -> str:
-        return tls_fingerprint(
-            self.cfg.probe_host, self.cfg.probe_port, self.cfg.site_domain
+        return self.probe_cert().fingerprint
+
+    def probe_cert(self) -> certutil.ServedCert:
+        return tls_served_cert(
+            self.cfg.probe_host,
+            self.cfg.probe_port,
+            self.cfg.site_domain,
+            timeout=self.cfg.probe_timeout,
         )
 
     def request_reload(self, token: str) -> None:
@@ -161,13 +183,16 @@ class CertService:
         self.control = control or RealControl(cfg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._alert_thread: threading.Thread | None = None
         self._probe_cache: tuple[float, str | None] = (0.0, None)
         self._last_restore = 0.0
+        self.alerts: AlertEngine | None = None
 
     # ------------------------------------------------------------ 生命周期
 
     def startup(self, background: bool = True) -> None:
         self.db.init_schema()
+        self.alerts = AlertEngine(self.db, self.control)
         with self.db.txn() as c:
             empty = c.execute("SELECT COUNT(*) n FROM versions").fetchone()["n"] == 0
         if empty:
@@ -196,16 +221,48 @@ class CertService:
                 log.warning("startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"])
         else:
             self._ensure_live_matches_active(served)
+        # 首次观测：立即用真实握手建立/刷新到期告警（重启后照样按事实重建）
+        self._initial_alert_sample()
         if background:
             self._thread = threading.Thread(
                 target=self._reconcile_loop, name="reconciler", daemon=True
             )
             self._thread.start()
+            self._alert_thread = threading.Thread(
+                target=self._alert_loop, name="alert-sampler", daemon=True
+            )
+            self._alert_thread.start()
+
+    def _initial_alert_sample(self) -> None:
+        try:
+            self.alerts.sample_once()
+        except Exception:
+            log.exception("initial alert sample failed")
+
+    def _alert_loop(self) -> None:
+        while not self._stop.wait(self.cfg.alert_interval):
+            try:
+                self.alerts.sample_once()
+            except Exception:
+                log.exception("alert sample tick failed")
+
+    def sample_alerts(self, now: dt.datetime | None = None) -> dict:
+        """手动触发一次采样（页面按钮/测试用）。"""
+        return self.alerts.sample_once(now)
+
+    def alert_snapshot(self, now: dt.datetime | None = None) -> dict:
+        return self.alerts.snapshot(now)
+
+    def acknowledge_alert(
+        self, alert_id: int, alert_key: str, now: dt.datetime | None = None
+    ) -> dict:
+        return self.alerts.acknowledge(alert_id, alert_key, now)
 
     def shutdown(self) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=3)
+        for t in (self._thread, self._alert_thread):
+            if t:
+                t.join(timeout=3)
         self.db.close()
 
     def _seed(self) -> None:
@@ -314,6 +371,7 @@ class CertService:
         target = self._version(op["version_id"])
         base = self._version(op["base_version_id"])
         # 1. 落盘新证书文件（原子替换）
+        self._prepare_service_change()
         self._write_live(target)
         if self.cfg.activate_delay_after_write:  # 测试钩子：制造崩溃窗口
             time.sleep(self.cfg.activate_delay_after_write)
@@ -334,21 +392,43 @@ class CertService:
             if receipt is not None and receipt.startswith("fail"):
                 break
             time.sleep(self.cfg.probe_interval)
+        # 服务端证书可能已在此期间变化，让在途告警采样作废
+        self._prepare_service_change()
         # 4. 判定
         if served == target["fingerprint"]:
             self._finalize_success(seq, note="新 TLS 连接已返回新证书")
+            self._sample_after_change()
             return
         if receipt is not None and receipt.startswith("fail"):
             self._rollback_files(base)
             self._finalize_fail(seq, f"Nginx 重载失败（{receipt}），已沿用旧证书")
+            self._sample_after_change()
             return
         if receipt == "ok" and served is not None:
             self._rollback_files(base)
             self._finalize_fail(seq, "重载后新连接仍返回旧证书，已回退并保持旧证书在用")
+            self._sample_after_change()
             return
-        # 回执不明或无法探测 -> 待核实
+        # 回执不明或无法探测 -> 待核实（告警状态不受影响，仍按真实观测）
         reason = "重载回执超时" if receipt is None else "无法建立新连接核实"
         self._mark_pending(seq, f"{reason}，待核实")
+        self._sample_after_change()
+
+    # ------------------------------------------------------------ 告警联动
+
+    def _prepare_service_change(self) -> None:
+        """服务端证书即将变化：使在途告警采样作废，防止迟到采样覆盖新状态。"""
+        if self.alerts is not None:
+            self.alerts.bump_epoch()
+
+    def _sample_after_change(self) -> None:
+        """服务变更落定后立即按真实握手刷新一次告警。"""
+        if self.alerts is None:
+            return
+        try:
+            self.alerts.sample_once()
+        except Exception:
+            log.exception("post-change alert sample failed")
 
     # ------------------------------------------------------------ 终态落库
 
@@ -356,6 +436,7 @@ class CertService:
         self._probe_cache = (0.0, None)
 
     def _finalize_success(self, seq: int, note: str = "") -> None:
+        self._prepare_service_change()
         with self.db.txn() as c:
             op = self._op(c, seq)
             if not op or op["state"] not in ("activating", "pending_verify"):
@@ -382,6 +463,7 @@ class CertService:
         self._invalidate_probe()
 
     def _finalize_fail(self, seq: int, reason: str) -> None:
+        self._prepare_service_change()
         with self.db.txn() as c:
             op = self._op(c, seq)
             if not op or op["state"] not in ("activating", "pending_verify"):
@@ -503,9 +585,11 @@ class CertService:
                 " ON v.id=s.active_version_id WHERE s.id=1"
             ).fetchone()
         if active:
+            self._prepare_service_change()
             self._write_live(dict(active))
             self.control.request_reload(f"recover-{uuid.uuid4().hex[:8]}")
             self._invalidate_probe()
+            self._sample_after_change()
 
     def _ensure_live_matches_active(self, served: str | None) -> None:
         with self.db.txn() as c:
@@ -518,17 +602,22 @@ class CertService:
         live_fp = self.live_fingerprint()
         if live_fp != active["fingerprint"]:
             log.warning("live 文件与在用版本不一致，恢复为版本 #%s", active["id"])
+            self._prepare_service_change()
             self._write_live(dict(active))
             self.control.request_reload(f"restore-{uuid.uuid4().hex[:8]}")
         elif served is not None and served != active["fingerprint"]:
             log.warning("Nginx 服务指纹与在用版本不一致，重新触发重载")
+            self._prepare_service_change()
             self.control.request_reload(f"restore-{uuid.uuid4().hex[:8]}")
+            self._sample_after_change()
 
     def _rollback_files(self, version: dict) -> None:
+        self._prepare_service_change()
         self._write_live(version)
         token = f"rollback-{uuid.uuid4().hex[:8]}"
         self.control.request_reload(token)
         self.control.wait_receipt(token, 3.0)  # 尽力而为
+        self._prepare_service_change()
 
     # ------------------------------------------------------------ 查询
 
@@ -575,6 +664,7 @@ class CertService:
             "versions": versions,
             "ops": ops,
             "latest_op": ops[0] if ops else None,
+            "alerts": self.alert_snapshot() if self.alerts else None,
         }
 
     def probe_cached(self, ttl: float = 2.0) -> str | None:

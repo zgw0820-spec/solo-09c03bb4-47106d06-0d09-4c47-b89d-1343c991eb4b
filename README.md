@@ -29,8 +29,9 @@ docker compose up --build
 ```
 
 首次启动自动生成演示 CA 与"旧证书"（版本 #1，在用）。
-用 `scripts/make_cert.py --data-dir <数据目录> --out-dir /tmp/newcert`
-可签发演示新证书用于上传（生产环境上传真实 CA 签发的证书即可）。
+用 `scripts/make_cert.py --data-dir <数据目录> --out-dir /tmp/newcert [--days 4]`
+可签发演示新证书用于上传（生产环境上传真实 CA 签发的证书即可）；
+`--days 4` 这类短有效期证书可直接在页面上看到到期告警与确认流程。
 
 无 Docker 时本地验证：`bash scripts/local_stack.sh up`（需 nginx 二进制，
 见 `NGINX_BIN` 环境变量）。
@@ -47,12 +48,41 @@ docker compose up --build
 | 回执不明/重启 | 操作置 `pending_verify`（页面显示"待核实"）；后台核实循环确认或超时回退；进程重启时按 Nginx 实际服务指纹对账，恢复到可确认的在用版本 |
 | 旧操作不覆盖新提交 | 任何落库/写文件前检查 `current_op_seq`；新操作创建时把待核实旧操作置 `superseded` |
 | 已有连接 | nginx 平滑重载，旧 worker 服务完旧连接再退出 |
+| 到期告警 | `web/app/alerts.py`：固定提前 7 天、按握手证书判定、服务区间 + 采样序号/纪元防迟到覆盖、确认只作用于本条告警 |
+
+## 到期告警（固定提前 7 天）
+
+页面「到期告警」区与 `GET /api/alerts` 展示**Nginx 新建 TLS 握手实际返回的
+证书**的有效期。判定只用握手证书，不看数据库里的候选版本或启用操作状态。
+
+- **提前 7 天**（含第 7 天）进入告警，生成**未确认**告警。
+- 值班员可对页面所见的**本条告警**点「确认」：只记录"看到了"，告警仍是
+  `open`，不会提前结案。确认表单带 `alert_key`（区间+指纹+到期时刻），
+  页面过期或告警已结束时确认被拒（409），不会误确认到下一条告警。
+- **上传候选、启用待核实都不影响告警**：只有握手真的看到新证书，旧告警才
+  解除；换上的证书若同样临期，会生成新的**未确认**告警。
+- **探测中断**（握手失败）：观测标为 `unknown`（页面显示"观测不明"），
+  告警与确认状态原样保留，恢复后继续跟踪同一告警。
+- **采样与启用/回退交错**：每次采样在开始时登记序号与"服务配置纪元"，
+  提交时若已有更新采样或服务配置已变化，整条迟到采样作废；迟到的旧采样
+  不能清掉新告警。每次写证书/重载/回退都会推进纪元。
+- **旧证书再次服务**（A→B→A）：按"服务区间"重新判定，生成新告警，
+  旧区间的确认不会被沿用；重启后区间与确认状态从库中恢复。
+
+告警相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/alerts` | 当前观测、未结告警、历史告警 |
+| `POST /api/alerts/sample` | 立即做一次真实握手采样 |
+| `POST /alerts/ack` | 表单确认（`alert_id` + `alert_key`） |
 
 ## 验证
 
 ```bash
-cd web && python3 -m pytest tests/ -q          # 24 项单元/集成测试
-bash scripts/local_stack.sh up && python3 scripts/e2e_check.py   # 19 项真实端到端
+cd web && python3 -m pytest tests/ -q          # 42 项单元/集成测试
+bash scripts/local_stack.sh up && python3 scripts/e2e_check.py      # 19 项真实端到端
+python3 scripts/alerts_e2e.py                  # 33 项到期告警端到端（真实 nginx）
 bash scripts/interrupt_check.sh                # 10 项崩溃/中断恢复实测
 ```
 

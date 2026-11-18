@@ -8,6 +8,8 @@ services:
       RELOAD_DIR: /reload
       NGINX_PROBE_HOST: nginx
       NGINX_PROBE_PORT: "443"
+      ALERT_INTERVAL: "5"        # 到期告警采样间隔（秒）
+      PROBE_TIMEOUT: "3"
     volumes:
       - webdata:/data
       - certs:/certs

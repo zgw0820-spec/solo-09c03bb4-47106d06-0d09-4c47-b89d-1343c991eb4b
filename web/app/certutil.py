@@ -143,6 +143,28 @@ class CertInfo:
     not_after: dt.datetime = None
 
 
+@dataclass
+class ServedCert:
+    """新建 TLS 连接实际拿到的叶子证书（告警的唯一事实来源）。"""
+
+    fingerprint: str
+    not_before: dt.datetime
+    not_after: dt.datetime
+
+
+def inspect_served_der(der: bytes) -> ServedCert:
+    """解析握手返回的叶子证书 DER。"""
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except ValueError as exc:
+        raise CertError(f"无法解析服务端证书: {exc}") from exc
+    return ServedCert(
+        fingerprint=fingerprint_der(der),
+        not_before=cert.not_valid_before_utc,
+        not_after=cert.not_valid_after_utc,
+    )
+
+
 def validate_upload(
     chain_pem: bytes, key_pem: bytes, domain: str, now: dt.datetime | None = None
 ) -> CertInfo:

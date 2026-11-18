@@ -30,16 +30,49 @@ class FakeControl:
         self.served: str | None = None
         self.reload_count = 0
         self.probe_error = False
+        # 到期告警依赖握手证书的有效期；默认与 live 文件的叶子证书一致
+        self.served_not_before = None
+        self.served_not_after = None
+        self.served_override: dict | None = None
 
     def _live_fp(self):
         return self.service.live_fingerprint()
 
+    def _live_cert(self):
+        from app import certutil
+
+        with open(f"{self.service.cfg.live_dir}/fullchain.pem", "rb") as f:
+            pem = f.read()
+        leaf = certutil.parse_pem_chain(pem)[0]
+        return certutil.ServedCert(
+            fingerprint=certutil.fingerprint_pem_chain(pem),
+            not_before=leaf.not_valid_before_utc,
+            not_after=leaf.not_valid_after_utc,
+        )
+
     def probe(self) -> str:
+        return self.probe_cert().fingerprint
+
+    def probe_cert(self):
+        from app import certutil
+
         if self.probe_error:
             raise ProbeError("fake probe error")
         if self.served is None:
             raise ProbeError("nothing served yet")
-        return self.served
+        if self.served_override is not None:
+            return self.served_override
+        try:
+            live = self._live_cert()
+        except (OSError, certutil.CertError):
+            raise ProbeError("no live cert")
+        if live.fingerprint == self.served:
+            return live
+        return certutil.ServedCert(
+            fingerprint=self.served,
+            not_before=self.served_not_before or live.not_before,
+            not_after=self.served_not_after or live.not_after,
+        )
 
     def request_reload(self, token: str) -> None:
         self.reload_count += 1

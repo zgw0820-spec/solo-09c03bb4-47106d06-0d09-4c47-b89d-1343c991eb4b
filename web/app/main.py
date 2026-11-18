@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from . import certutil
+from . import alerts as alerts_mod
 from .service import BadRequest, CertService, Conflict, Config, NotFound
 
 logging.basicConfig(
@@ -64,6 +65,41 @@ def api_op(seq: int):
         return service.get_op(seq)
     except NotFound as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+@app.get("/api/alerts")
+def api_alerts():
+    """当前告警与观测状态（页面与外部监控共用）。"""
+    return service.alert_snapshot()
+
+
+@app.post("/api/alerts/sample")
+def api_alerts_sample(redirect: int = Form(0)):
+    """立即对站点新建一次 TLS 握手并刷新告警。"""
+    result = service.sample_alerts()
+    snap = service.alert_snapshot()
+    if redirect:
+        target = "/?msg=" + quote("已完成一次实测采样")
+        return RedirectResponse(target, status_code=303)
+    return JSONResponse({"sample": result, "alerts": snap})
+
+
+@app.post("/alerts/ack")
+def ack_alert(
+    request: Request,
+    alert_id: int = Form(...),
+    alert_key: str = Form(...),
+    redirect: int = Form(0),
+):
+    """确认页面所见的本次告警（只作用于该告警，不解除观测）。"""
+    try:
+        alert = service.acknowledge_alert(alert_id, alert_key)
+    except alerts_mod.AlertStale as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 409)
+    except alerts_mod.AlertError as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 404)
+    msg = f"告警 #{alert['id']} 已确认（证书仍将在 {alert['not_after'][:10]} 到期）"
+    return _respond(request, redirect, {"msg": msg, "alert": alert})
 
 
 @app.post("/upload")
